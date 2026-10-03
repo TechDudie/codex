@@ -1273,6 +1273,14 @@
         "plan_mode_reasoning_effort": {
           "$ref": "#/definitions/ReasoningEffort"
         },
+        "proxy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProxyConfigToml"
+            }
+          ],
+          "description": "Explicit proxy routing for Codex-owned HTTP and WebSocket requests."
+        },
         "sandbox_mode": {
           "$ref": "#/definitions/SandboxMode"
         },
@@ -3603,6 +3611,20 @@
           "$ref": "#/definitions/TrustLevel"
         }
       },
+      "type": "object"
+    },
+    "ProxyConfigToml": {
+      "additionalProperties": false,
+      "description": "Explicit proxy routing for Codex-owned outbound HTTP and WebSocket requests.",
+      "properties": {
+        "url": {
+          "description": "Proxy URL. Supports `http`, `https`, `socks5` (local DNS), and `socks5h` (proxy DNS), with optional username/password authentication. SOCKS5 uses port 1080 when omitted. Takes precedence over environment and system proxies, without direct fallback.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
       "type": "object"
     },
     "RawMcpServerConfig": {
@@ -7592,6 +7614,14 @@
         "$ref": "#/definitions/ProjectConfig"
       },
       "type": "object"
+    },
+    "proxy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProxyConfigToml"
+        }
+      ],
+      "description": "Explicit proxy routing for Codex-owned HTTP and WebSocket requests."
     },
     "realtime": {
       "allOf": [

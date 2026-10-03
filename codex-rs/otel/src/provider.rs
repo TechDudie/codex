@@ -470,12 +470,22 @@ fn build_logger(
                 None => base_tls_config,
             };
 
-            let exporter = LogExporter::builder()
+            let channel = crate::grpc_proxy::build_channel(
+                factory,
+                &endpoint,
+                tls_config.clone(),
+                opentelemetry_otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+                OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+            )?;
+            let mut exporter_builder = LogExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_metadata(MetadataMap::from_headers(header_map))
-                .with_tls_config(tls_config)
-                .build()?;
+                .with_tls_config(tls_config);
+            if let Some(channel) = channel {
+                exporter_builder = exporter_builder.with_channel(channel);
+            }
+            let exporter = exporter_builder.build()?;
 
             builder = builder.with_batch_exporter(crate::network_policy::PolicyExporter {
                 exporter,
@@ -501,7 +511,7 @@ fn build_logger(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if factory.network_policy().is_managed() {
+            if factory.network_policy().is_managed() || factory.has_explicit_proxy() {
                 let client = crate::otlp::build_async_http_client(
                     factory,
                     tls.as_ref(),
@@ -552,12 +562,22 @@ fn build_tracer_provider(
                 None => base_tls_config,
             };
 
-            SpanExporter::builder()
+            let channel = crate::grpc_proxy::build_channel(
+                factory,
+                &endpoint,
+                tls_config.clone(),
+                opentelemetry_otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+                OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+            )?;
+            let mut exporter_builder = SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_metadata(MetadataMap::from_headers(header_map))
-                .with_tls_config(tls_config)
-                .build()?
+                .with_tls_config(tls_config);
+            if let Some(channel) = channel {
+                exporter_builder = exporter_builder.with_channel(channel);
+            }
+            exporter_builder.build()?
         }
         OtelExporter::OtlpHttp {
             endpoint,
@@ -611,7 +631,7 @@ fn build_tracer_provider(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if factory.network_policy().is_managed() {
+            if factory.network_policy().is_managed() || factory.has_explicit_proxy() {
                 let client = crate::otlp::build_async_http_client(
                     factory,
                     tls.as_ref(),

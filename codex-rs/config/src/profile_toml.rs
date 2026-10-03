@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config_toml::ToolsToml;
+use crate::proxy::ProxyConfigToml;
 use crate::types::AnalyticsConfigToml;
 use crate::types::ApprovalsReviewer;
 use crate::types::Personality;
@@ -22,6 +23,8 @@ use codex_protocol::protocol::AskForApproval;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigProfile {
+    /// Explicit proxy routing for Codex-owned HTTP and WebSocket requests.
+    pub proxy: Option<ProxyConfigToml>,
     pub model: Option<String>,
     /// Optional explicit service tier request id for new turns (for example
     /// `default`, `priority`, or `flex`; legacy `fast` also works).

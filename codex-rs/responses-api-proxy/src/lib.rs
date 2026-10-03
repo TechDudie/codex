@@ -13,6 +13,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
+use codex_http_client::OutboundProxyRoute;
 use reqwest::Url;
 use reqwest::blocking::Client;
 use reqwest::header::AUTHORIZATION;
@@ -71,6 +72,11 @@ struct ForwardConfig {
 
 /// Entry point for the library main, for parity with other crates.
 pub fn run_main(args: Args) -> Result<()> {
+    run_main_with_proxy_route(args, OutboundProxyRoute::TransportDefault)
+}
+
+/// Runs the forwarding server using the CLI's resolved upstream proxy route.
+pub fn run_main_with_proxy_route(args: Args, proxy_route: OutboundProxyRoute) -> Result<()> {
     let auth_header = read_auth_header_from_stdin()?;
 
     let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
@@ -99,13 +105,7 @@ pub fn run_main(args: Args) -> Result<()> {
     }
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
-    let client = Arc::new(
-        Client::builder()
-            // Disable reqwest's 30s default so long-lived response streams keep flowing.
-            .timeout(None::<Duration>)
-            .build()
-            .context("building reqwest client")?,
-    );
+    let client = Arc::new(build_http_client(proxy_route)?);
 
     eprintln!("responses-api-proxy listening on {bound_addr}");
 
@@ -134,6 +134,26 @@ pub fn run_main(args: Args) -> Result<()> {
 
     Err(anyhow!("server stopped unexpectedly"))
 }
+
+fn build_http_client(proxy_route: OutboundProxyRoute) -> Result<Client> {
+    // Long-lived response streams must keep flowing without reqwest's 30s default timeout.
+    let builder = Client::builder().timeout(/*timeout*/ None::<Duration>);
+    let builder = match proxy_route {
+        OutboundProxyRoute::TransportDefault => builder,
+        OutboundProxyRoute::Direct => builder.no_proxy(),
+        OutboundProxyRoute::Proxy { url, no_proxy } => {
+            let proxy = reqwest::Proxy::all(url)
+                .map_err(|_| anyhow!("invalid upstream proxy configuration"))?;
+            let no_proxy = no_proxy.as_deref().and_then(reqwest::NoProxy::from_string);
+            builder.no_proxy().proxy(proxy.no_proxy(no_proxy))
+        }
+    };
+    builder.build().context("building upstream HTTP client")
+}
+
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod proxy_tests;
 
 fn bind_listener(port: Option<u16>) -> Result<(TcpListener, SocketAddr)> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port.unwrap_or(0)));

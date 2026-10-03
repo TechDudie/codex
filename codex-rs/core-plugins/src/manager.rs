@@ -3165,6 +3165,7 @@ impl PluginsManager {
                 .iter_mut()
                 .find(|pending| pending.has_same_cache_identity(&request))
             {
+                pending.service_config = request.service_config;
                 pending.scopes.extend(request.scopes);
                 pending.auth = request.auth;
                 pending.mode = match (pending.mode, request.mode) {

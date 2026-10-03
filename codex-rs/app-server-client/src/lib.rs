@@ -784,6 +784,10 @@ impl AppServerClient {
 }
 
 #[cfg(test)]
+#[path = "remote_proxy_tests.rs"]
+mod remote_proxy_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use codex_app_server_protocol::AccountUpdatedNotification;
@@ -958,8 +962,9 @@ mod tests {
         format!("ws://{addr}")
     }
 
-    async fn expect_remote_initialize<S>(websocket: &mut tokio_tungstenite::WebSocketStream<S>)
-    where
+    pub(super) async fn expect_remote_initialize<S>(
+        websocket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         expect_remote_initialize_with_metadata(
@@ -998,7 +1003,7 @@ mod tests {
         assert_eq!(notification.method, "initialized");
     }
 
-    async fn read_websocket_message<S>(
+    pub(super) async fn read_websocket_message<S>(
         websocket: &mut tokio_tungstenite::WebSocketStream<S>,
     ) -> JSONRPCMessage
     where
@@ -1023,7 +1028,7 @@ mod tests {
         }
     }
 
-    async fn write_websocket_message<S>(
+    pub(super) async fn write_websocket_message<S>(
         websocket: &mut tokio_tungstenite::WebSocketStream<S>,
         message: JSONRPCMessage,
     ) where
@@ -1093,7 +1098,7 @@ mod tests {
         })
     }
 
-    fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
+    pub(super) fn test_remote_connect_args(websocket_url: String) -> RemoteAppServerConnectArgs {
         RemoteAppServerConnectArgs {
             endpoint: RemoteAppServerEndpoint::WebSocket {
                 websocket_url,

@@ -1058,6 +1058,21 @@ async fn local_layers_keep_raw_paths_order_and_legacy_requirements() {
 }
 
 #[test]
+fn project_config_cannot_set_explicit_proxy_routing() {
+    let mut config: TomlValue = toml::from_str(
+        "model = \"project-model\"\n[proxy]\nurl = \"socks5h://proxy.example:1080\"",
+    )
+    .expect("valid project config");
+    let ignored =
+        sanitize_project_config(&mut config, CredentialBrokerProjectState::Unconfigured, &[]);
+    assert_eq!(ignored, vec!["proxy".to_string()]);
+    assert_eq!(
+        config,
+        toml::from_str::<TomlValue>("model = \"project-model\"").expect("valid expected config")
+    );
+}
+
+#[test]
 fn project_config_cannot_change_system_proxy_routing() {
     for key in ["respect_system_proxy", "system_proxy_fallback"] {
         for enabled in [false, true] {

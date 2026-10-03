@@ -59,11 +59,13 @@ impl CliConfigOverrides {
                 };
                 let value_str = parts
                     .next()
-                    .ok_or_else(|| format!("Invalid override (missing '='): {s}"))?
+                    .ok_or_else(|| {
+                        "Invalid override (missing '='); expected key=value".to_string()
+                    })?
                     .trim();
 
                 if key.is_empty() {
-                    return Err(format!("Empty key in override: {s}"));
+                    return Err("Empty key in override; expected key=value".to_string());
                 }
 
                 // Attempt to parse as TOML. If that fails, treat it as a raw

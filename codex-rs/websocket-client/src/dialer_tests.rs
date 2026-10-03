@@ -1,3 +1,6 @@
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
@@ -36,6 +39,302 @@ use crate::AsyncIo;
 use crate::WebSocketConnection;
 use crate::WebSocketConnector;
 use crate::WebSocketTlsMode;
+
+#[tokio::test]
+async fn socks5h_tunnels_websocket_with_remote_dns_and_decoded_credentials() {
+    let request = assert_socks_tunnel(
+        "ws",
+        "socks5h",
+        "unresolvable.invalid",
+        "user%40name:pass%3Aword@",
+    )
+    .await;
+    assert_eq!(
+        (request.address, request.auth),
+        (
+            SocksAddress::Domain("unresolvable.invalid".to_string()),
+            Some(("user@name".to_string(), "pass:word".to_string())),
+        )
+    );
+}
+
+#[tokio::test]
+async fn socks5_tunnels_secure_websocket_with_local_dns() {
+    let request = assert_socks_tunnel("wss", "socks5", "localhost", "").await;
+    let SocksAddress::Ip(address) = request.address else {
+        panic!("socks5 must send a locally resolved IP address");
+    };
+    assert!(address.is_loopback());
+    assert_eq!(request.auth, None);
+}
+
+#[tokio::test]
+async fn socks5h_tunnels_secure_websocket_with_remote_dns() {
+    let request = assert_socks_tunnel("wss", "socks5h", "localhost", "").await;
+    assert_eq!(
+        (request.address, request.auth),
+        (SocksAddress::Domain("localhost".to_string()), None)
+    );
+}
+
+#[tokio::test]
+async fn socks5h_encodes_ipv4_and_ipv6_destination_literals() {
+    for (host, address) in [
+        ("192.0.2.1", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+        ("[2001:db8::7]", IpAddr::V6("2001:db8::7".parse().unwrap())),
+    ] {
+        let request = assert_socks_tunnel("ws", "socks5h", host, "").await;
+        assert_eq!(
+            (request.address, request.auth),
+            (SocksAddress::Ip(address), None)
+        );
+    }
+}
+
+#[tokio::test]
+async fn environment_socks_proxy_preserves_dns_modes_in_a_subprocess() {
+    for (scheme, host) in [("socks5", "localhost"), ("socks5h", "unresolvable.invalid")] {
+        let (target, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
+        let (proxy, proxy_task) = start_socks_proxy(target, SocksOutcome::Tunnel).await;
+        let executable = std::env::current_exe().unwrap();
+        let target_url = format!("ws://{host}:{}/v1/responses", target.port());
+        let proxy_url = format!("{scheme}://{proxy}");
+        let output = tokio::task::spawn_blocking(move || {
+            let mut command = Command::new(executable);
+            command.args([
+                "--exact",
+                "dialer::tests::no_proxy_subprocess_probe",
+                "--nocapture",
+            ]);
+            for key in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+                "CODEX_WEBSOCKET_NO_PROXY_PROBE_CA_DER",
+            ] {
+                command.env_remove(key);
+            }
+            command
+                .env("ALL_PROXY", &proxy_url)
+                .env("NO_PROXY", "unrelated.example")
+                .env("CODEX_WEBSOCKET_NO_PROXY_PROBE_URL", target_url)
+                .env("CODEX_WEBSOCKET_NO_PROXY_PROBE_PROXY", proxy_url)
+                .env("CODEX_WEBSOCKET_TRANSPORT_DEFAULT_PROBE", "1")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "SOCKS environment subprocess failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        target_task.await.unwrap();
+        let request = proxy_task.await.unwrap();
+        match scheme {
+            "socks5" => {
+                let SocksAddress::Ip(address) = request.address else {
+                    panic!("environment socks5 must resolve locally");
+                };
+                assert!(address.is_loopback());
+            }
+            "socks5h" => assert_eq!(request.address, SocksAddress::Domain(host.to_string())),
+            _ => panic!("unsupported test SOCKS scheme"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn socks5_connect_rejection_does_not_connect_directly() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = target.local_addr().unwrap();
+    let (proxy, proxy_task) = start_socks_proxy(address, SocksOutcome::Reject).await;
+    let request = format!("ws://{address}/v1/responses")
+        .into_client_request()
+        .unwrap();
+    let result = connect(
+        request,
+        WebSocketConfig::default(),
+        /*tls_config*/ None,
+        OutboundProxyRoute::Proxy {
+            url: format!("socks5h://{proxy}"),
+            no_proxy: None,
+        },
+        TcpNodelay::Default,
+        /*loopback_direct*/ false,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("SOCKS rejection must fail the connection");
+    };
+    assert!(matches!(
+        error,
+        WebSocketError::Url(UrlError::ProxyConnect(_))
+    ));
+    proxy_task.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err(),
+        "a rejected proxy connection must not bypass the proxy"
+    );
+}
+
+#[test]
+fn invalid_proxy_credentials_are_redacted() {
+    let error = ProxyEndpoint::parse("socks5h://username:secret%FF@proxy.example:1080")
+        .expect_err("invalid UTF-8 credentials must fail");
+    assert_eq!(error.to_string(), invalid_proxy_config().to_string());
+    let environment_error = redact_proxy_error(WebSocketError::Url(UrlError::InvalidProxyConfig(
+        "socks5h://username:secret@proxy.example:bad-port".to_string(),
+    )));
+    assert_eq!(
+        environment_error.to_string(),
+        invalid_proxy_config().to_string()
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SocksAddress {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SocksRequest {
+    auth: Option<(String, String)>,
+    address: SocksAddress,
+    port: u16,
+}
+
+#[derive(Clone, Copy)]
+enum SocksOutcome {
+    Tunnel,
+    Reject,
+}
+
+async fn assert_socks_tunnel(
+    websocket_scheme: &str,
+    proxy_scheme: &str,
+    host: &str,
+    credentials: &str,
+) -> SocksRequest {
+    let (tls_config, acceptor, _) = test_tls_configs();
+    let acceptor = match websocket_scheme {
+        "wss" => Some(acceptor),
+        "ws" => None,
+        _ => panic!("unsupported test WebSocket scheme"),
+    };
+    let (target_addr, target_task) = start_echo_websocket_server(acceptor).await;
+    let (proxy_addr, proxy_task) = start_socks_proxy(target_addr, SocksOutcome::Tunnel).await;
+    let request = format!(
+        "{websocket_scheme}://{host}:{}/v1/responses",
+        target_addr.port()
+    )
+    .into_client_request()
+    .unwrap();
+    let (inner, _) = connect(
+        request,
+        WebSocketConfig::default(),
+        Some(tls_config),
+        OutboundProxyRoute::Proxy {
+            url: format!("{proxy_scheme}://{credentials}{proxy_addr}"),
+            no_proxy: None,
+        },
+        TcpNodelay::Enabled,
+        /*loopback_direct*/ false,
+    )
+    .await
+    .expect("SOCKS WebSocket connection should succeed");
+    let mut websocket = test_connection(inner);
+    let message = Message::Text("SOCKS tunnel".into());
+    websocket.send(message.clone()).await.unwrap();
+    assert_eq!(websocket.next().await.unwrap().unwrap(), message);
+    drop(websocket);
+    target_task.await.unwrap();
+    let request = proxy_task.await.unwrap();
+    assert_eq!(request.port, target_addr.port());
+    request
+}
+
+async fn start_socks_proxy(
+    target: SocketAddr,
+    outcome: SocksOutcome,
+) -> (SocketAddr, JoinHandle<SocksRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut client, _) = listener.accept().await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), 5);
+        let methods_length = client.read_u8().await.unwrap();
+        let mut methods = vec![0; usize::from(methods_length)];
+        client.read_exact(&mut methods).await.unwrap();
+        let auth = match methods.as_slice() {
+            [0] => {
+                client.write_all(&[5, 0]).await.unwrap();
+                None
+            }
+            [0, 2] => {
+                client.write_all(&[5, 2]).await.unwrap();
+                assert_eq!(client.read_u8().await.unwrap(), 1);
+                let username = read_socks_string(&mut client).await;
+                let password = read_socks_string(&mut client).await;
+                client.write_all(&[1, 0]).await.unwrap();
+                Some((username, password))
+            }
+            _ => panic!("unexpected SOCKS authentication methods: {methods:?}"),
+        };
+        let mut header = [0; 4];
+        client.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..3], &[5, 1, 0]);
+        let address = match header[3] {
+            1 => {
+                let mut bytes = [0; 4];
+                client.read_exact(&mut bytes).await.unwrap();
+                SocksAddress::Ip(IpAddr::V4(Ipv4Addr::from(bytes)))
+            }
+            4 => {
+                let mut bytes = [0; 16];
+                client.read_exact(&mut bytes).await.unwrap();
+                SocksAddress::Ip(IpAddr::V6(Ipv6Addr::from(bytes)))
+            }
+            3 => SocksAddress::Domain(read_socks_string(&mut client).await),
+            address_type => panic!("unexpected SOCKS address type: {address_type}"),
+        };
+        let port = client.read_u16().await.unwrap();
+        let status = match outcome {
+            SocksOutcome::Tunnel => 0,
+            SocksOutcome::Reject => 5,
+        };
+        client
+            .write_all(&[5, status, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        if let SocksOutcome::Tunnel = outcome {
+            let mut target = tokio::net::TcpStream::connect(target).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut target).await;
+        }
+        SocksRequest {
+            auth,
+            address,
+            port,
+        }
+    });
+    (address, task)
+}
+
+async fn read_socks_string(stream: &mut tokio::net::TcpStream) -> String {
+    let length = stream.read_u8().await.unwrap();
+    let mut bytes = vec![0; usize::from(length)];
+    stream.read_exact(&mut bytes).await.unwrap();
+    String::from_utf8(bytes).unwrap()
+}
 
 #[tokio::test]
 async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
@@ -273,14 +572,19 @@ async fn no_proxy_subprocess_probe() {
         } else {
             test_tls_configs().0
         };
+    let route = if std::env::var("CODEX_WEBSOCKET_TRANSPORT_DEFAULT_PROBE").is_ok() {
+        OutboundProxyRoute::TransportDefault
+    } else {
+        OutboundProxyRoute::Proxy {
+            url: proxy_url,
+            no_proxy: Some(no_proxy),
+        }
+    };
     let (inner, _) = connect(
         request,
         WebSocketConfig::default(),
         Some(tls_config),
-        OutboundProxyRoute::Proxy {
-            url: proxy_url,
-            no_proxy: Some(no_proxy),
-        },
+        route,
         TcpNodelay::Enabled,
         /*loopback_direct*/ false,
     )

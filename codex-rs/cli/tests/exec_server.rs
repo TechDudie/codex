@@ -97,6 +97,64 @@ fn local_exec_server_ignores_invalid_config_without_strict_config() -> Result<()
     Ok(())
 }
 
+#[test]
+fn local_exec_server_rejects_invalid_proxy_without_strict_config() -> Result<()> {
+    for (config, expected_error) in [
+        (
+            "[proxy]\nurl = \"socks4://private-user:private-password@private-proxy.example:1080\"\n",
+            "invalid proxy.url",
+        ),
+        ("[proxy]\nurl = 123\n", "invalid type: integer `123`"),
+        ("[proxy]\n", "missing field `url`"),
+        (
+            "model_provider = \"missing-provider\"\n[proxy]\nurl = \"socks5h://private-user:private-password@private-proxy.example:1080\"\n",
+            "Model provider `missing-provider` not found",
+        ),
+    ] {
+        let codex_home = TempDir::new()?;
+        std::fs::write(codex_home.path().join("config.toml"), config)?;
+
+        let mut cmd = codex_command(codex_home.path())?;
+        cmd.args(["exec-server", "--listen", "stdio"])
+            .assert()
+            .failure()
+            .stderr(
+                contains(expected_error)
+                    .and(contains("private-user").not())
+                    .and(contains("private-password").not())
+                    .and(contains("private-proxy.example").not()),
+            );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn local_exec_server_rejects_invalid_config_with_proxy_override() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(codex_home.path().join("config.toml"), "not valid toml = [")?;
+
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args([
+        "-c",
+        "proxy.url=\"socks5h://private-user:private-password@private-proxy.example:1080\"",
+        "exec-server",
+        "--listen",
+        "stdio",
+    ])
+    .assert()
+    .failure()
+    .stderr(
+        contains("config.toml")
+            .and(contains("expected"))
+            .and(contains("private-user").not())
+            .and(contains("private-password").not())
+            .and(contains("private-proxy.example").not()),
+    );
+
+    Ok(())
+}
+
 /// The standalone exec-server accepts an explicit per-connection concurrency limit.
 #[test]
 fn local_exec_server_accepts_concurrent_requests_flag() -> Result<()> {

@@ -46,6 +46,63 @@ fn test_get_codex_user_agent() {
     assert!(user_agent.starts_with(&prefix));
 }
 
+#[tokio::test]
+async fn default_clients_honor_configured_proxy_with_unmanaged_network_policy() {
+    use codex_http_client::HttpTransport;
+    use codex_http_client::Request;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+
+    let proxy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(3)
+        .mount(&proxy)
+        .await;
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+        .with_proxy_url(&proxy.uri())
+        .unwrap();
+    let endpoint = "http://api.invalid/configured-proxy";
+    let clients = [
+        create_client_with_chatgpt_cookies(&factory),
+        create_client_for_route(
+            &factory,
+            endpoint,
+            ClientRouteClass::Api,
+            ClientRedirectPolicy::Default,
+        )
+        .unwrap(),
+    ];
+    for client in clients {
+        client
+            .get(endpoint)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let transport = create_transport_for_routes_async(factory, ClientRouteClass::Api)
+        .await
+        .unwrap();
+    transport
+        .execute(Request::new(http::Method::GET, endpoint.to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["/configured-proxy"; 3]
+    );
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn os_discovery_is_cached_without_freezing_user_agent_overrides() {

@@ -37,22 +37,24 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
+use codex_websocket_client::WebSocketConnection;
+use codex_websocket_client::WebSocketConnector;
+use codex_websocket_client::WebSocketTlsMode;
+use futures::Sink;
 use futures::SinkExt;
+use futures::Stream;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async_with_config;
-use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -179,7 +181,25 @@ enum SocketPeerPolicy {
 
 impl RemoteAppServerClient {
     pub async fn connect(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
-        Self::connect_with_policy(args, SocketPeerPolicy::ExplicitEndpoint).await
+        Self::connect_with_http_client_factory(
+            args,
+            &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .await
+    }
+
+    /// Connects using the caller's configured outbound proxy and network policy.
+    /// Local Unix socket endpoints continue to use their validated socket transport.
+    pub async fn connect_with_http_client_factory(
+        args: RemoteAppServerConnectArgs,
+        http_client_factory: &HttpClientFactory,
+    ) -> IoResult<Self> {
+        Self::connect_with_policy(
+            args,
+            SocketPeerPolicy::ExplicitEndpoint,
+            http_client_factory,
+        )
+        .await
     }
 
     /// Connects to an implicitly discovered Windows daemon, verifying its peer
@@ -192,12 +212,18 @@ impl RemoteAppServerClient {
                 "local daemon requires a Unix socket",
             ));
         }
-        Self::connect_with_policy(args, SocketPeerPolicy::NonElevatedCurrentUser).await
+        Self::connect_with_policy(
+            args,
+            SocketPeerPolicy::NonElevatedCurrentUser,
+            &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .await
     }
 
     async fn connect_with_policy(
         args: RemoteAppServerConnectArgs,
         peer_policy: SocketPeerPolicy,
+        http_client_factory: &HttpClientFactory,
     ) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let initialize_params = args.initialize_params();
@@ -207,7 +233,8 @@ impl RemoteAppServerClient {
                 auth_token,
             } => {
                 let (endpoint, stream) =
-                    connect_websocket_endpoint(websocket_url, auth_token).await?;
+                    connect_websocket_endpoint(websocket_url, auth_token, http_client_factory)
+                        .await?;
                 Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
                     .await
             }
@@ -239,11 +266,15 @@ impl RemoteAppServerClient {
     async fn connect_with_stream<S>(
         channel_capacity: usize,
         endpoint: String,
-        stream: WebSocketStream<S>,
+        stream: S,
         initialize_params: InitializeParams,
     ) -> IoResult<Self>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: Stream<Item = Result<Message, TungsteniteError>>
+            + Sink<Message, Error = TungsteniteError>
+            + Unpin
+            + Send
+            + 'static,
     {
         let mut stream = stream;
         let (pending_events, metadata) = initialize_remote_connection(
@@ -264,7 +295,7 @@ impl RemoteAppServerClient {
                 tokio::select! {
                     command = command_rx.recv() => {
                         let Some(command) = command else {
-                            let _ = stream.close(None).await;
+                            let _ = stream.close().await;
                             break;
                         };
                         match command {
@@ -346,7 +377,7 @@ impl RemoteAppServerClient {
                                 let _ = response_tx.send(result);
                             }
                             RemoteClientCommand::Shutdown { response_tx } => {
-                                let close_result = stream.close(None).await.or_else(|err| {
+                                let close_result = stream.close().await.or_else(|err| {
                                     if websocket_close_error_is_already_closed(&err) {
                                         Ok(())
                                     } else {
@@ -698,7 +729,8 @@ impl RemoteAppServerRequestHandle {
 async fn connect_websocket_endpoint(
     websocket_url: String,
     auth_token: Option<String>,
-) -> IoResult<(String, WebSocketStream<MaybeTlsStream<TcpStream>>)> {
+    http_client_factory: &HttpClientFactory,
+) -> IoResult<(String, WebSocketConnection)> {
     let url = Url::parse(&websocket_url).map_err(|err| {
         IoError::new(
             ErrorKind::InvalidInput,
@@ -733,13 +765,14 @@ async fn connect_websocket_endpoint(
 
     ensure_rustls_crypto_provider();
     let websocket_config = remote_websocket_config();
+    let connector = WebSocketConnector::new_with_tls_mode(
+        http_client_factory,
+        WebSocketTlsMode::TungsteniteDefault,
+    )
+    .map_err(IoError::other)?;
     let stream = timeout(
         CONNECT_TIMEOUT,
-        connect_async_with_config(
-            request,
-            Some(websocket_config),
-            /*disable_nagle*/ false,
-        ),
+        connector.connect(request, websocket_config),
     )
     .await
     .map_err(|_| {
@@ -818,13 +851,15 @@ fn remote_websocket_config() -> WebSocketConfig {
 }
 
 async fn initialize_remote_connection<S>(
-    stream: &mut WebSocketStream<S>,
+    stream: &mut S,
     endpoint: &str,
     params: InitializeParams,
     initialize_timeout: Duration,
 ) -> IoResult<(Vec<AppServerEvent>, RemoteServerMetadata)>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Stream<Item = Result<Message, TungsteniteError>>
+        + Sink<Message, Error = TungsteniteError>
+        + Unpin,
 {
     let initialize_request_id = RequestId::String("initialize".to_string());
     let mut pending_events = Vec::new();
@@ -1009,12 +1044,12 @@ fn jsonrpc_notification_from_client_notification(
 }
 
 async fn write_jsonrpc_message<S>(
-    stream: &mut WebSocketStream<S>,
+    stream: &mut S,
     message: JSONRPCMessage,
     endpoint: &str,
 ) -> IoResult<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Sink<Message, Error = TungsteniteError> + Unpin,
 {
     let payload = serde_json::to_string(&message).map_err(IoError::other)?;
     stream

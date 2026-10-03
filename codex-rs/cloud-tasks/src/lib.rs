@@ -13,8 +13,6 @@ use codex_cloud_tasks_client::TaskStatus;
 use codex_git_utils::current_branch_name;
 use codex_git_utils::default_branch_name;
 use codex_http_client::ClientRouteClass;
-use codex_http_client::HttpClientFactory;
-use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::RouteAwareClientPool;
 use codex_login::default_client::get_codex_user_agent;
 use owo_colors::OwoColorize;
@@ -56,10 +54,11 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     let base_url = util::validate_chatgpt_base_url(&base_url)?;
 
     set_user_agent_suffix(user_agent_suffix);
+    let (auth_manager, http_client_factory) =
+        util::load_auth_manager(Some(base_url.clone())).await?;
 
     #[cfg(debug_assertions)]
     if use_mock {
-        let http_client_factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
         return Ok(BackendContext {
             backend: Arc::new(codex_cloud_tasks_mock_client::MockClient),
             base_url,
@@ -71,7 +70,6 @@ async fn init_backend(user_agent_suffix: &str) -> anyhow::Result<BackendContext>
     }
 
     let ua = get_codex_user_agent();
-    let (auth_manager, http_client_factory) = util::load_auth_manager(Some(base_url.clone())).await;
     let environment_http = RouteAwareClientPool::new_without_redirects_or_request_logging(
         http_client_factory.clone(),
         ClientRouteClass::Api,
@@ -206,7 +204,7 @@ async fn resolve_environment_id(ctx: &BackendContext, requested: &str) -> anyhow
         return Err(anyhow!("environment id must not be empty"));
     }
     let normalized = util::normalize_base_url(&ctx.base_url);
-    let headers = util::build_chatgpt_headers().await;
+    let headers = util::build_chatgpt_headers().await?;
     let environments =
         crate::env_detect::list_environments(&ctx.environment_http, &normalized, &headers).await?;
     if environments.is_empty() {
@@ -870,16 +868,19 @@ pub async fn run_main(cli: Cli, _codex_linux_sandbox_exe: Option<PathBuf>) -> an
         tokio::spawn(async move {
             let base_url = util::normalize_base_url(&base_url);
             // Build headers: UA + ChatGPT auth if available
-            let headers = util::build_chatgpt_headers().await;
-
             // Run autodetect. If it fails, we keep using "All".
-            let res = crate::env_detect::autodetect_environment_id(
-                &environment_http,
-                &base_url,
-                &headers,
-                /*desired_label*/ None,
-            )
-            .await;
+            let res = match util::build_chatgpt_headers().await {
+                Ok(headers) => {
+                    crate::env_detect::autodetect_environment_id(
+                        &environment_http,
+                        &base_url,
+                        &headers,
+                        /*desired_label*/ None,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             let _ = tx.send(app::AppEvent::EnvironmentAutodetected(res));
         });
     }
@@ -2030,8 +2031,10 @@ fn spawn_environment_load(
 ) {
     tokio::spawn(async move {
         let base_url = util::normalize_base_url(&base_url);
-        let headers = util::build_chatgpt_headers().await;
-        let result = crate::env_detect::list_environments(&http, &base_url, &headers).await;
+        let result = match util::build_chatgpt_headers().await {
+            Ok(headers) => crate::env_detect::list_environments(&http, &base_url, &headers).await,
+            Err(error) => Err(error),
+        };
         let _ = tx.send(app::AppEvent::EnvironmentsLoaded(result));
     });
 }

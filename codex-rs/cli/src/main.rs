@@ -1346,7 +1346,7 @@ async fn cli_main(
                             .build()
                             .await
                             .map_err(anyhow::Error::from);
-                        let http_client_factory = updater_http_client_factory(config);
+                        let http_client_factory = updater_http_client_factory(config)?;
                         if matches!(
                             daemon_cli.subcommand,
                             AppServerDaemonSubcommand::Update { .. }
@@ -1781,8 +1781,21 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 "responses-api-proxy",
             )?;
-            tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))
-                .await??;
+            let cli_overrides = root_config_overrides
+                .parse_overrides()
+                .map_err(anyhow::Error::msg)?;
+            let config = ConfigBuilder::default()
+                .cli_overrides(cli_overrides)
+                .build()
+                .await?;
+            let factory = config.http_client_factory();
+            let route = factory
+                .resolve_proxy_route_async(args.upstream_url.clone())
+                .await?;
+            tokio::task::spawn_blocking(move || {
+                codex_responses_api_proxy::run_main_with_proxy_route(args, route)
+            })
+            .await??;
         }
         Some(Subcommand::StdioToUds(cmd)) => {
             reject_remote_mode_for_subcommand(
@@ -2334,16 +2347,8 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
 
 fn updater_http_client_factory(
     config: anyhow::Result<codex_core::config::Config>,
-) -> codex_http_client::HttpClientFactory {
-    match config {
-        Ok(config) => config.http_client_factory(),
-        Err(error) => {
-            eprintln!("warning: failed to load updater network configuration: {error}");
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            )
-        }
-    }
+) -> anyhow::Result<codex_http_client::HttpClientFactory> {
+    config.map(|config| config.http_client_factory())
 }
 
 async fn print_app_server_remote_control_output(
@@ -2767,30 +2772,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn updater_http_client_factory_honors_respect_system_proxy() {
+    async fn updater_http_client_factory_honors_configured_proxy() {
         let codex_home = tempfile::tempdir().expect("temporary Codex home");
         let config = ConfigBuilder::default()
             .codex_home(codex_home.path().to_path_buf())
-            .cli_overrides(vec![(
-                "features.respect_system_proxy".to_string(),
-                toml::Value::Boolean(true),
-            )])
+            .cli_overrides(vec![
+                (
+                    "features.respect_system_proxy".to_string(),
+                    toml::Value::Boolean(true),
+                ),
+                (
+                    "proxy.url".to_string(),
+                    toml::Value::String("socks5h://proxy.example:1080".to_string()),
+                ),
+            ])
             .build()
             .await
             .expect("config should load");
 
+        let factory =
+            updater_http_client_factory(Ok(config)).expect("updater factory should build");
         assert_eq!(
-            updater_http_client_factory(Ok(config)).outbound_proxy_policy(),
+            factory.outbound_proxy_policy(),
             codex_http_client::OutboundProxyPolicy::RespectSystemProxy
         );
-    }
-
-    #[test]
-    fn updater_http_client_factory_falls_back_when_config_load_fails() {
         assert_eq!(
-            updater_http_client_factory(Err(anyhow::anyhow!("invalid config")))
-                .outbound_proxy_policy(),
-            codex_http_client::OutboundProxyPolicy::ReqwestDefault
+            factory.resolve_proxy_route("https://github.com/openai/codex/releases"),
+            codex_http_client::OutboundProxyRoute::Proxy {
+                url: "socks5h://proxy.example:1080".to_string(),
+                no_proxy: None,
+            }
         );
     }
 

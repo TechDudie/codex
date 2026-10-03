@@ -622,12 +622,26 @@ fn build_otlp_metric_exporter(
                 None => base_tls_config,
             };
 
-            opentelemetry_otlp::MetricExporter::builder()
+            let channel = crate::grpc_proxy::build_channel(
+                factory,
+                &endpoint,
+                tls_config.clone(),
+                opentelemetry_otlp::OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+                OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+            )
+            .map_err(|err| MetricsError::InvalidConfig {
+                message: err.to_string(),
+            })?;
+            let mut exporter_builder = opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .with_temporality(temporality)
                 .with_metadata(MetadataMap::from_headers(header_map))
-                .with_tls_config(tls_config)
+                .with_tls_config(tls_config);
+            if let Some(channel) = channel {
+                exporter_builder = exporter_builder.with_channel(channel);
+            }
+            exporter_builder
                 .build()
                 .map_err(|source| MetricsError::ExporterBuild { source })
         }
@@ -651,7 +665,7 @@ fn build_otlp_metric_exporter(
                 .with_protocol(protocol)
                 .with_headers(headers);
 
-            if factory.network_policy().is_managed() {
+            if factory.network_policy().is_managed() || factory.has_explicit_proxy() {
                 let client = crate::otlp::build_async_http_client(
                     factory,
                     tls.as_ref(),

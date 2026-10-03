@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::handshake::client::Response;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::proxy::ProxyConfig;
+use tokio_tungstenite::tungstenite::proxy::ProxyScheme;
 
 use crate::AsyncIo;
 use crate::ConnectionInner;
@@ -42,49 +43,76 @@ pub(crate) async fn connect(
     loopback_direct: bool,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
     let disable_nagle = tcp_nodelay == TcpNodelay::Enabled;
-    let proxy_url = match proxy_route {
-        OutboundProxyRoute::TransportDefault => {
-            // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
-            // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
-            let (stream, response) = connect_async_tls_with_config(
-                request,
-                Some(config),
-                disable_nagle,
-                tls_config.map(Connector::Rustls),
-            )
-            .await?;
-            return Ok((ConnectionInner::Left(stream), response));
+    // The upstream async SOCKS dialer sends domains remotely for both schemes. Route environment
+    // SOCKS proxies through our explicit path so `socks5` consistently resolves DNS locally.
+    let environment_socks_proxy = if matches!(
+        &proxy_route,
+        OutboundProxyRoute::TransportDefault
+            | OutboundProxyRoute::Proxy {
+                no_proxy: Some(_),
+                ..
+            }
+    ) {
+        match ProxyConfig::from_env(request.uri()).map_err(redact_proxy_error) {
+            Ok(proxy) => proxy
+                .filter(|proxy| matches!(proxy.scheme, ProxyScheme::Socks5 | ProxyScheme::Socks5h)),
+            // HTTPS proxies need the explicit TLS-to-proxy path below.
+            Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => None,
+            Err(error) => return Err(error),
         }
-        OutboundProxyRoute::Direct => None,
-        OutboundProxyRoute::Proxy {
-            url,
-            no_proxy: None,
-        } => Some(url),
-        OutboundProxyRoute::Proxy {
-            url,
-            no_proxy: Some(_),
-        } => {
-            // Let Tungstenite apply its complete NO_PROXY semantics. Its environment parser does
-            // not accept HTTPS proxy URLs, but that error occurs only after it decides the target
-            // is not bypassed, so retry that case through the explicit TLS-to-proxy path below.
-            match connect_async_tls_with_config(
-                request.clone(),
-                Some(config),
-                disable_nagle,
-                tls_config.clone().map(Connector::Rustls),
-            )
-            .await
-            {
-                Ok((stream, response)) => {
-                    return Ok((ConnectionInner::Left(stream), response));
+    } else {
+        None
+    };
+    let proxy = if let Some(config) = environment_socks_proxy {
+        Some(ProxyEndpoint { config, tls: false })
+    } else {
+        match proxy_route {
+            OutboundProxyRoute::TransportDefault => {
+                // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
+                // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
+                let (stream, response) = connect_async_tls_with_config(
+                    request,
+                    Some(config),
+                    disable_nagle,
+                    tls_config.map(Connector::Rustls),
+                )
+                .await
+                .map_err(redact_proxy_error)?;
+                return Ok((ConnectionInner::Left(stream), response));
+            }
+            OutboundProxyRoute::Direct => None,
+            OutboundProxyRoute::Proxy {
+                url,
+                no_proxy: None,
+            } => Some(ProxyEndpoint::parse(&url)?),
+            OutboundProxyRoute::Proxy {
+                url,
+                no_proxy: Some(_),
+            } => {
+                // Let Tungstenite apply its complete NO_PROXY semantics. Its environment parser does
+                // not accept HTTPS proxy URLs, but that error occurs only after it decides the target
+                // is not bypassed, so retry that case through the explicit TLS-to-proxy path below.
+                match connect_async_tls_with_config(
+                    request.clone(),
+                    Some(config),
+                    disable_nagle,
+                    tls_config.clone().map(Connector::Rustls),
+                )
+                .await
+                {
+                    Ok((stream, response)) => {
+                        return Ok((ConnectionInner::Left(stream), response));
+                    }
+                    Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => {
+                        Some(ProxyEndpoint::parse(&url)?)
+                    }
+                    Err(error) => return Err(redact_proxy_error(error)),
                 }
-                Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => Some(url),
-                Err(error) => return Err(error),
             }
         }
     };
 
-    let stream: Box<dyn AsyncIo> = match proxy_url {
+    let stream: Box<dyn AsyncIo> = match proxy {
         None => {
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
@@ -97,21 +125,24 @@ pub(crate) async fn connect(
             .map_err(WebSocketError::Io)?;
             Box::new(stream)
         }
-        Some(url) => {
-            let proxy = ProxyEndpoint::parse(&url)?;
+        Some(proxy) => {
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            let stream = connect_tcp(proxy.config.authority(), tcp_nodelay)
-                .await
-                .map_err(WebSocketError::Io)?;
+            let stream = connect_tcp(
+                host_port(&proxy.config.host, proxy.config.port),
+                tcp_nodelay,
+            )
+            .await
+            .map_err(WebSocketError::Io)?;
             let stream: Box<dyn AsyncIo> = if proxy.tls {
                 let proxy_tls_config = match &tls_config {
                     Some(tls_config) => Arc::clone(tls_config),
                     None => build_rustls_client_config_with_custom_ca()
                         .map_err(|error| WebSocketError::Io(error.into()))?,
                 };
-                let server_name = ServerName::try_from(proxy.config.host.clone())
-                    .map_err(|_| WebSocketError::Tls(TlsError::InvalidDnsName))?;
+                let server_name =
+                    ServerName::try_from(normalize_host(&proxy.config.host).to_owned())
+                        .map_err(|_| WebSocketError::Tls(TlsError::InvalidDnsName))?;
                 let stream = TlsConnector::from(proxy_tls_config)
                     .connect(server_name, stream)
                     .await
@@ -120,7 +151,25 @@ pub(crate) async fn connect(
             } else {
                 Box::new(stream)
             };
-            connect_via_proxy(stream, &proxy.config, host, port).await?
+            let host = match proxy.config.scheme {
+                ProxyScheme::Http => host.to_owned(),
+                ProxyScheme::Socks5h => normalize_host(host).to_owned(),
+                ProxyScheme::Socks5 => tokio::net::lookup_host((normalize_host(host), port))
+                    .await
+                    .map_err(WebSocketError::Io)?
+                    .next()
+                    .ok_or_else(|| {
+                        WebSocketError::Io(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "SOCKS5 destination did not resolve to an address",
+                        ))
+                    })?
+                    .ip()
+                    .to_string(),
+            };
+            connect_via_proxy(stream, &proxy.config, &host, port)
+                .await
+                .map_err(redact_proxy_error)?
         }
     };
 
@@ -167,6 +216,19 @@ impl ProxyEndpoint {
 
 fn invalid_proxy_config() -> WebSocketError {
     WebSocketError::Url(UrlError::InvalidProxyConfig("<redacted>".to_string()))
+}
+
+fn redact_proxy_error(error: WebSocketError) -> WebSocketError {
+    match error {
+        WebSocketError::Url(UrlError::InvalidProxyConfig(_)) => invalid_proxy_config(),
+        error => error,
+    }
+}
+
+fn normalize_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn websocket_host(request: &Request) -> Result<&str, WebSocketError> {

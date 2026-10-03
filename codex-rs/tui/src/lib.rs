@@ -493,18 +493,35 @@ pub fn remote_addr_supports_auth_token(endpoint: &RemoteAppServerEndpoint) -> bo
     }
 }
 
+#[cfg(test)]
 async fn connect_remote_app_server(
     endpoint: RemoteAppServerEndpoint,
 ) -> color_eyre::Result<AppServerClient> {
-    let app_server = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+    connect_remote_app_server_with_http_client_factory(
         endpoint,
-        client_name: "codex-tui".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        experimental_api: true,
-        mcp_server_openai_form_elicitation: false,
-        opt_out_notification_methods: Vec::new(),
-        channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
-    })
+        &codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+    )
+    .await
+}
+
+async fn connect_remote_app_server_with_http_client_factory(
+    endpoint: RemoteAppServerEndpoint,
+    http_client_factory: &codex_http_client::HttpClientFactory,
+) -> color_eyre::Result<AppServerClient> {
+    let app_server = RemoteAppServerClient::connect_with_http_client_factory(
+        RemoteAppServerConnectArgs {
+            endpoint,
+            client_name: "codex-tui".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            experimental_api: true,
+            mcp_server_openai_form_elicitation: false,
+            opt_out_notification_methods: Vec::new(),
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        },
+        http_client_factory,
+    )
     .await
     .wrap_err("failed to connect to remote app server")?;
     Ok(AppServerClient::Remote(app_server))
@@ -565,7 +582,13 @@ async fn start_app_server(
     let connection = if matches!(target, AppServerTarget::Embedded) {
         None
     } else {
-        Some(app_server_connection::connect(target).await)
+        Some(
+            app_server_connection::connect_with_http_client_factory(
+                target,
+                &config.http_client_factory(),
+            )
+            .await,
+        )
     };
     if let Some(connection) = connection {
         match connection {

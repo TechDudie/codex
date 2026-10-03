@@ -6,6 +6,7 @@ pub(crate) mod provider;
 pub(crate) mod trace_context;
 
 mod agent_response;
+mod grpc_proxy;
 mod guardian_assessment;
 mod network_policy;
 mod otlp;

@@ -166,6 +166,7 @@ impl fmt::Debug for OutboundProxyRoute {
 #[derive(Clone)]
 pub struct HttpClientFactory {
     outbound_proxy_policy: OutboundProxyPolicy,
+    explicit_proxy_url: Option<Arc<str>>,
     system_proxy_fallback: bool,
     chatgpt_cookie_store: Option<Arc<ChatGptCookieStore>>,
     network_policy: NetworkPolicy,
@@ -174,6 +175,7 @@ pub struct HttpClientFactory {
 impl PartialEq for HttpClientFactory {
     fn eq(&self, other: &Self) -> bool {
         self.outbound_proxy_policy == other.outbound_proxy_policy
+            && self.explicit_proxy_url == other.explicit_proxy_url
             && self.system_proxy_fallback == other.system_proxy_fallback
             && self.network_policy == other.network_policy
             && self
@@ -193,6 +195,7 @@ impl fmt::Debug for HttpClientFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpClientFactory")
             .field("outbound_proxy_policy", &self.outbound_proxy_policy)
+            .field("has_explicit_proxy", &self.has_explicit_proxy())
             .field("system_proxy_fallback", &self.system_proxy_fallback)
             .field("network_policy", &self.network_policy)
             .finish()
@@ -204,10 +207,25 @@ impl HttpClientFactory {
     pub const fn new(outbound_proxy_policy: OutboundProxyPolicy) -> Self {
         Self {
             outbound_proxy_policy,
+            explicit_proxy_url: None,
             system_proxy_fallback: false,
             chatgpt_cookie_store: None,
             network_policy: NetworkPolicy::unmanaged(),
         }
+    }
+
+    /// Routes HTTP and WebSocket requests through a configured proxy, taking precedence over
+    /// environment and system settings. SOCKS5 defaults to port 1080; `socks5h` resolves target
+    /// hostnames at the proxy. Connection failures never fall back to a different route.
+    pub fn with_proxy_url(mut self, url: &str) -> Result<Self, BuildRouteAwareHttpClientError> {
+        self.explicit_proxy_url = Some(crate::configured_proxy::validate_proxy_url(url)?.into());
+        self.system_proxy_fallback = false;
+        Ok(self)
+    }
+
+    /// Returns whether application configuration selects an explicit outbound proxy.
+    pub fn has_explicit_proxy(&self) -> bool {
+        self.explicit_proxy_url.is_some()
     }
 
     /// Carries the account/configuration owner's application policy into every transport.
@@ -235,6 +253,7 @@ impl HttpClientFactory {
 
     pub fn allows_system_proxy_fallback(&self) -> bool {
         self.system_proxy_fallback
+            && !self.has_explicit_proxy()
             && self.outbound_proxy_policy == OutboundProxyPolicy::ReqwestDefault
     }
 
@@ -267,6 +286,12 @@ impl HttpClientFactory {
     /// resolution is unavailable, explicit environment settings are resolved before falling back
     /// to a direct route.
     pub fn resolve_proxy_route(&self, request_url: &str) -> OutboundProxyRoute {
+        if let Some(url) = &self.explicit_proxy_url {
+            return OutboundProxyRoute::Proxy {
+                url: url.to_string(),
+                no_proxy: None,
+            };
+        }
         resolve_proxy_route(
             &ProcessEnv,
             request_url,
@@ -280,6 +305,9 @@ impl HttpClientFactory {
         &self,
         request_url: String,
     ) -> io::Result<OutboundProxyRoute> {
+        if self.has_explicit_proxy() {
+            return Ok(self.resolve_proxy_route(&request_url));
+        }
         if matches!(
             self.outbound_proxy_policy,
             OutboundProxyPolicy::ReqwestDefault
@@ -329,6 +357,14 @@ impl HttpClientFactory {
         request_url: &str,
         route_class: ClientRouteClass,
     ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
+        if self.has_explicit_proxy() {
+            let builder = configure_builder_for_resolved_route(
+                builder,
+                route_class,
+                &self.resolve_proxy_route(request_url),
+            )?;
+            return build_reqwest_client_with_custom_ca(builder).map_err(Into::into);
+        }
         build_reqwest_client_for_route(
             builder,
             request_url,
@@ -524,7 +560,7 @@ fn configure_concrete_proxy(
             return Err(BuildRouteAwareHttpClientError::InvalidProxyConfig { route_class });
         }
     };
-    Ok(builder.proxy(proxy.no_proxy(no_proxy)))
+    Ok(builder.no_proxy().proxy(proxy.no_proxy(no_proxy)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

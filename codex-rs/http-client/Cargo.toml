@@ -11,6 +11,8 @@ futures = { workspace = true }
 http = { workspace = true }
 http-body = "1.0.1"
 httpdate = { workspace = true }
+# SOCKS IPv6 destinations require the bracket handling fix in 0.1.21.
+hyper-util = "0.1.21"
 native-tls = "0.2"
 opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
@@ -25,6 +27,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+urlencoding = { workspace = true }
 zstd = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

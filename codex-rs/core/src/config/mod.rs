@@ -611,6 +611,9 @@ pub struct Config {
     pub application_network_policy: codex_http_client::NetworkPolicy,
     /// Auth bootstrap routing installed by the app-server configuration owner.
     pub application_auth_route_config: Option<AuthRouteConfig>,
+    /// Validated explicit proxy routing, before applying runtime destination policy.
+    #[doc(hidden)]
+    pub configured_proxy_http_client_factory: Option<HttpClientFactory>,
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
     /// requirements).
     pub config_layer_stack: ConfigLayerStack,
@@ -1700,9 +1703,16 @@ impl Config {
         } else {
             OutboundProxyPolicy::ReqwestDefault
         };
-        let mut factory = HttpClientFactory::new(outbound_proxy_policy)
+        let mut factory = self
+            .configured_proxy_http_client_factory
+            .clone()
+            .unwrap_or_else(|| HttpClientFactory::new(outbound_proxy_policy))
+            .with_outbound_proxy_policy(outbound_proxy_policy)
             .with_network_policy(self.application_network_policy.clone());
-        if !self.respect_system_proxy && self.features.enabled(Feature::SystemProxyFallback) {
+        if !factory.has_explicit_proxy()
+            && !self.respect_system_proxy
+            && self.features.enabled(Feature::SystemProxyFallback)
+        {
             factory = factory.with_system_proxy_fallback();
         }
         if self.features.enabled(Feature::Psp) {
@@ -3079,6 +3089,14 @@ pub fn resolve_bootstrap_http_client_factory(
     {
         factory = factory.with_system_proxy_fallback();
     }
+    if let Some(proxy) = cfg.proxy.as_ref() {
+        factory = factory.with_proxy_url(&proxy.url).map_err(|error| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                anyhow::Error::new(error).context("invalid proxy.url"),
+            )
+        })?;
+    }
     Ok(factory)
 }
 
@@ -3423,6 +3441,25 @@ impl Config {
             None
         };
         let respect_system_proxy = features.enabled(Feature::RespectSystemProxy);
+        let configured_proxy_http_client_factory = cfg
+            .proxy
+            .as_ref()
+            .map(|proxy| {
+                let policy = if respect_system_proxy {
+                    OutboundProxyPolicy::RespectSystemProxy
+                } else {
+                    OutboundProxyPolicy::ReqwestDefault
+                };
+                HttpClientFactory::new(policy)
+                    .with_proxy_url(&proxy.url)
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            anyhow::Error::new(error).context("invalid proxy.url"),
+                        )
+                    })
+            })
+            .transpose()?;
         let enable_network_proxy = features.enabled(Feature::NetworkProxy);
         let PreparedWindowsSandboxConfig {
             mode: windows_sandbox_mode,
@@ -4387,6 +4424,7 @@ impl Config {
             config_layer_stack,
             application_network_policy: Default::default(),
             application_auth_route_config: None,
+            configured_proxy_http_client_factory,
             history,
             ephemeral: ephemeral.unwrap_or_default(),
             extra_config: None,
@@ -4952,3 +4990,7 @@ mod tests;
 #[cfg(test)]
 #[path = "config_loader_tests.rs"]
 mod config_loader_tests;
+
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod proxy_tests;

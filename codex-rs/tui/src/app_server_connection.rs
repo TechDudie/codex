@@ -3,7 +3,6 @@
 use crate::AppServerTarget;
 #[cfg(windows)]
 use crate::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
-use crate::connect_remote_app_server;
 use codex_app_server_client::AppServerClient;
 #[cfg(windows)]
 use codex_app_server_client::RemoteAppServerClient;
@@ -11,10 +10,23 @@ use codex_app_server_client::RemoteAppServerClient;
 use codex_app_server_client::RemoteAppServerConnectArgs;
 #[cfg(windows)]
 use codex_app_server_client::RemoteAppServerEndpoint;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 #[cfg(windows)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 pub(crate) async fn connect(target: &AppServerTarget) -> color_eyre::Result<AppServerClient> {
+    connect_with_http_client_factory(
+        target,
+        &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+    .await
+}
+
+pub(crate) async fn connect_with_http_client_factory(
+    target: &AppServerTarget,
+    http_client_factory: &HttpClientFactory,
+) -> color_eyre::Result<AppServerClient> {
     match target {
         AppServerTarget::Embedded => {
             color_eyre::eyre::bail!("embedded sessions have no remote connection")
@@ -43,7 +55,11 @@ pub(crate) async fn connect(target: &AppServerTarget) -> color_eyre::Result<AppS
             Ok(AppServerClient::Remote(app_server))
         }
         AppServerTarget::LocalDaemon { endpoint, .. } | AppServerTarget::Remote { endpoint } => {
-            connect_remote_app_server(endpoint.clone()).await
+            crate::connect_remote_app_server_with_http_client_factory(
+                endpoint.clone(),
+                http_client_factory,
+            )
+            .await
         }
     }
 }

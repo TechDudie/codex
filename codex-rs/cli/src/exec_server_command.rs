@@ -15,6 +15,7 @@ use codex_core::config::bootstrap_auth_config;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
 use codex_exec_server::ExecServerRuntimeOptions;
+use codex_http_client::BuildRouteAwareHttpClientError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
@@ -275,7 +276,99 @@ impl ExecServerCommand {
                 /*enable_workload_identity*/ false,
             )
             .await;
-            let config = if strict_config {
+            // Local exec servers tolerate unrelated configuration failures for compatibility.
+            // An invalid explicit proxy must fail closed for delegated HTTP requests.
+            let invalid_proxy = config_result.as_ref().is_err_and(|error| {
+                error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<BuildRouteAwareHttpClientError>(),
+                        Some(BuildRouteAwareHttpClientError::InvalidProxyConfig { .. })
+                    )
+                })
+            });
+            // Deserialization or unrelated validation can fail before URL validation. Inspect
+            // the effective raw settings on this exceptional path so a selected proxy is never
+            // discarded with the rest of an unusable configuration.
+            let configured_proxy = if !strict_config && !invalid_proxy && config_result.is_err() {
+                let overrides = root_config_overrides
+                    .parse_overrides()
+                    .map_err(anyhow::Error::msg)?;
+                if overrides
+                    .iter()
+                    .any(|(key, _)| key == "proxy" || key.starts_with("proxy."))
+                {
+                    true
+                } else {
+                    let codex_home = find_codex_home()?;
+                    let cwd = AbsolutePathBuf::current_dir()?;
+                    // Project files cannot select a proxy. Skip them during this inspection so
+                    // project discovery or syntax failures cannot conceal a global proxy.
+                    let options = ConfigLoadOptions {
+                        loader_overrides: LoaderOverrides {
+                            ignore_project_config: true,
+                            ..LoaderOverrides::default()
+                        },
+                        strict_config,
+                        cloud_config_bundle: Default::default(),
+                    };
+                    match codex_config::loader::load_config_layers_state(
+                        codex_exec_server::LOCAL_FS.as_ref(),
+                        &codex_home,
+                        Some(cwd.clone()),
+                        &overrides,
+                        options.clone(),
+                        &codex_config::NoopThreadConfigLoader,
+                    )
+                    .await
+                    {
+                        Ok(layers) => layers.effective_config().get("proxy").is_some(),
+                        Err(error) => {
+                            let user_file = codex_home.join(codex_config::CONFIG_TOML_FILE);
+                            // Preserve the legacy syntax-error tolerance only when the user
+                            // file cannot contain a proxy key. Escaped TOML keys require a
+                            // backslash, so those files also require a successful config load.
+                            let unrelated_user_syntax_error = error
+                                .get_ref()
+                                .and_then(|cause| {
+                                    cause.downcast_ref::<codex_config::ConfigLoadError>()
+                                })
+                                .is_some_and(|error| {
+                                    error.config_error().path.as_path() == user_file.as_path()
+                                })
+                                && tokio::fs::read_to_string(&user_file).await.is_ok_and(
+                                    |contents| {
+                                        !contents.contains("proxy")
+                                            && !contents.contains('\\')
+                                            && toml::from_str::<toml::Value>(&contents).is_err()
+                                    },
+                                );
+                            if unrelated_user_syntax_error {
+                                let mut options = options;
+                                options.loader_overrides.ignore_user_config = true;
+                                // Inherited proxy settings still apply when user TOML is broken.
+                                // Any failure to inspect those settings requires a config error.
+                                codex_config::loader::load_config_layers_state(
+                                    codex_exec_server::LOCAL_FS.as_ref(),
+                                    &codex_home,
+                                    Some(cwd),
+                                    &overrides,
+                                    options,
+                                    &codex_config::NoopThreadConfigLoader,
+                                )
+                                .await
+                                .map_or(/*default*/ true, |layers| {
+                                    layers.effective_config().get("proxy").is_some()
+                                })
+                            } else {
+                                true
+                            }
+                        }
+                    }
+                }
+            } else {
+                false
+            };
+            let config = if strict_config || invalid_proxy || configured_proxy {
                 Some(config_result?)
             } else {
                 config_result.ok()
